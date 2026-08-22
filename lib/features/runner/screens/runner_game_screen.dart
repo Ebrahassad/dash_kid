@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
@@ -20,7 +18,6 @@ import '../managers/settings_manager.dart';
 import '../models/level_model.dart';
 import '../models/obstacle_model.dart';
 import '../models/item_model.dart';
-import '../models/world_model.dart';
 
 import '../widgets/hud_widget.dart';
 import '../widgets/item_widget.dart';
@@ -55,11 +52,6 @@ class _RunnerGameScreenState extends State<RunnerGameScreen>
 
   static const double _minimumVisibleDistance = GameConstants.minimumVisibleDistance;
 
-  /// Visibility window scales with the player's current speed so obstacles
-  /// are always visible for a consistent amount of reaction time — and is
-  /// always <= the engine's spawn lookahead (spawnLookaheadSeconds >
-  /// obstacleReactionSeconds), so content is always already spawned by the
-  /// time it would enter view.
   double _visibilityWindowFor(double forwardSpeed) {
     return (forwardSpeed * GameConstants.obstacleReactionSeconds).clamp(
       GameConstants.minVisibilityWindowMeters,
@@ -183,7 +175,25 @@ class _RunnerGameScreenState extends State<RunnerGameScreen>
             return Stack(
               fit: StackFit.expand,
               children: [
-                _buildParallaxBackground(context, engine, world),
+                // The background artwork itself is untouched — a single,
+                // ordinary full-screen image exactly as before. Forward
+                // motion instead comes from the scrolling lane-marking
+                // overlay below it (a separate, simple CustomPainter layer
+                // — not the image itself), which reuses the exact same
+                // TrackGeometry math already proven correct for obstacles,
+                // so it lines up with the road perfectly and carries zero
+                // risk of the kind of layout-composition glitch that
+                // showed up when an earlier attempt tried to crop/repeat
+                // a slice of the image itself.
+                Image.asset(
+                  world.backgroundAsset,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) => Container(color: Colors.black),
+                ),
+                CustomPaint(
+                  size: MediaQuery.of(context).size,
+                  painter: _RoadMarkingsPainter(distanceMeters: engine.distanceMeters),
+                ),
                 ..._buildTrackObjects(context, engine),
                 _buildRunner(context, engine),
                 HudWidget(engine: engine, onPause: _openPause),
@@ -192,71 +202,6 @@ class _RunnerGameScreenState extends State<RunnerGameScreen>
           },
         ),
       ),
-    );
-  }
-
-  /// Two-layer parallax built entirely from the single existing background
-  /// asset (no new art): a near-static sky/skyline layer that keeps the
-  /// horizon/vanishing point visually fixed, and a scrolling "road band"
-  /// (the lower portion of the same image) whose scroll offset is driven
-  /// directly by `engine.distanceMeters` — not an independent animation
-  /// clock — so it always matches the runner's actual speed, including
-  /// through speed boosts or pauses. The road band is rendered twice,
-  /// offset by exactly its own height, so as one copy scrolls out the
-  /// bottom the identical other copy continues seamlessly from the top.
-  Widget _buildParallaxBackground(BuildContext context, RunnerEngine engine, WorldModel world) {
-    final size = MediaQuery.of(context).size;
-    final distance = engine.distanceMeters;
-
-    final skyDrift =
-        math.sin(distance * GameConstants.parallaxSkyDriftPerMeter) * GameConstants.parallaxSkyMaxDriftPixels;
-
-    final roadBandHeight = size.height * GameConstants.parallaxRoadBandHeightFraction;
-    final rawScroll = distance * GameConstants.parallaxRoadScrollPerMeter;
-    final scrollOffset = roadBandHeight <= 0 ? 0.0 : rawScroll % roadBandHeight;
-
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // Sky / skyline — kept (almost) fixed so the vanishing point never
-        // visibly moves. A tiny bounded drift keeps it from reading as a
-        // dead, frozen photograph without ever revealing image edges.
-        Transform.translate(
-          offset: Offset(0, skyDrift),
-          child: Image.asset(
-            world.backgroundAsset,
-            fit: BoxFit.cover,
-            errorBuilder: (context, error, stackTrace) => Container(color: Colors.black),
-          ),
-        ),
-        // Scrolling road band.
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 0,
-          height: roadBandHeight,
-          child: ClipRect(
-            child: Stack(
-              children: [
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  top: scrollOffset - roadBandHeight,
-                  height: roadBandHeight,
-                  child: _RoadBand(world: world, screenSize: size),
-                ),
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  top: scrollOffset,
-                  height: roadBandHeight,
-                  child: _RoadBand(world: world, screenSize: size),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -274,10 +219,9 @@ class _RunnerGameScreenState extends State<RunnerGameScreen>
     final margin = size.width * GameConstants.runnerScreenMarginFraction;
 
     // Keep the runner's full sprite width on screen at all times, even at
-    // the outer lanes near the road's wide near-camera edge — the actual
-    // fix for the character getting clipped when moving to the far
-    // left/right lane. Computed from screen width and the runner's own
-    // half-width, not an arbitrary clamp.
+    // the outer lanes near the road's wide near-camera edge — computed
+    // from screen width and the runner's own half-width, not an arbitrary
+    // clamp.
     final minCenterX = margin + halfWidth;
     final maxCenterX = size.width - margin - halfWidth;
     final laneX = minCenterX <= maxCenterX
@@ -361,32 +305,57 @@ class _RunnerGameScreenState extends State<RunnerGameScreen>
   }
 }
 
-/// Renders just the lower [GameConstants.parallaxRoadBandHeightFraction]
-/// portion of the world's background image, scaled to fill [screenSize] —
-/// this is the "road band" used twice (double-buffered) by
-/// `_buildParallaxBackground` to create a seamless scrolling loop from a
-/// single static asset.
-class _RoadBand extends StatelessWidget {
-  final WorldModel world;
-  final Size screenSize;
+/// Draws simple scrolling lane-divider dashes, positioned by the exact
+/// same `TrackGeometry` math already used for obstacles/items, so they
+/// line up with the road perfectly and always move at a rate that matches
+/// the runner's real forward speed (driven directly by
+/// `engine.distanceMeters`, not an independent animation clock).
+///
+/// Deliberately implemented as plain geometric shapes on a Canvas rather
+/// than by cropping/repeating a slice of the background image — that
+/// approach is straightforward to reason about and get pixel-exact
+/// (`Canvas.drawRRect` has no constraint-propagation ambiguity), unlike
+/// image-region compositing via widget layout, which produced a visible
+/// rendering glitch (duplicated/offset scenery) in an earlier attempt.
+class _RoadMarkingsPainter extends CustomPainter {
+  final double distanceMeters;
 
-  const _RoadBand({required this.world, required this.screenSize});
+  _RoadMarkingsPainter({required this.distanceMeters});
+
+  static const double _dashSpacingMeters = 18.0;
+  static const int _dashCount = 10;
+  static const List<double> _laneBoundaries = [0.5, 1.5];
 
   @override
-  Widget build(BuildContext context) {
-    return ClipRect(
-      child: Align(
-        alignment: Alignment.bottomCenter,
-        heightFactor: GameConstants.parallaxRoadBandHeightFraction,
-        child: Image.asset(
-          world.backgroundAsset,
-          fit: BoxFit.cover,
-          width: screenSize.width,
-          height: screenSize.height,
-          alignment: Alignment.bottomCenter,
-          errorBuilder: (context, error, stackTrace) => Container(color: Colors.black87),
-        ),
-      ),
-    );
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.white.withOpacity(0.75);
+
+    final continuousPhase = distanceMeters / _dashSpacingMeters;
+
+    for (final laneBoundary in _laneBoundaries) {
+      for (int i = 0; i < _dashCount; i++) {
+        final t = ((i + continuousPhase) % _dashCount) / _dashCount;
+
+        final x = TrackGeometry.laneX(size.width, laneBoundary, t);
+        final y = TrackGeometry.depthY(size.height, t);
+        final scale = TrackGeometry.perspectiveScale(t);
+
+        final dashWidth = 5.0 * scale;
+        final dashHeight = 24.0 * scale;
+
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: Offset(x, y), width: dashWidth, height: dashHeight),
+            Radius.circular(dashWidth / 2),
+          ),
+          paint,
+        );
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _RoadMarkingsPainter oldDelegate) {
+    return oldDelegate.distanceMeters != distanceMeters;
   }
 }
